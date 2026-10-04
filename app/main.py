@@ -1,0 +1,273 @@
+"""FastAPI 应用：家庭储能时段调度。"""
+
+from __future__ import annotations
+
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+from app.audit import audit_telemetry
+from app.models import (
+    BatchAppendRequest,
+    BatchAppendResponse,
+    DispatchRequest,
+    DispatchResponse,
+    ErrorResponse,
+    ReplanRequest,
+    ReplanResponse,
+    SessionCreateRequest,
+    SessionCreateResponse,
+    SessionDetailResponse,
+    SessionListResponse,
+    SettlementRequest,
+    SettlementResponse,
+    TelemetryAuditRequest,
+    TelemetryAuditResponse,
+)
+from app.replan import ReplanError, execute_replan
+from app.sessions import SessionError, append_batch, create_session, get_session, list_sessions
+from app.settlement import SettlementError, execute_settlement
+from app.solver import InfeasibleError, solve_dispatch
+
+app = FastAPI(
+    title="家庭储能时段调度 API",
+    description=(
+        "输入半小时电价/基础负荷/光伏预测与电池参数，"
+        "按 0.1kWh 离散 SOC 做动态规划，求满足功率、SOC 与末端约束的最低总成本计划；"
+        "另提供 /telemetry/audit 对半小时实测记录做电芯能量守恒与购电量核对"
+        "（只审计标记异常，不修正读数、不生成调度计划）；"
+        "/dispatch/settlement 对已下发计划做执行结算：重算校验计划快照、"
+        "复用遥测审计并核对 SOC 轨迹，仅对首个异常/断点之前的连续有效区间计费；"
+        "/dispatch/replan 支持计划执行中途依据连续实测前缀续排：核对原计划与前缀审计、"
+        "从实测末态重排余段，并给出可直接交给 /dispatch/settlement 的余段输入与快照；"
+        "/dispatch/sessions 提供可持久接续的执行会话：创建时提交原 /dispatch 输入、"
+        "完整计划快照与审计容差（先重算确认快照一致），之后按时段下标成批追加半小时"
+        "实测记录（沿用遥测审计、整批通过才入库、同起点重试幂等、内容不同返回冲突），"
+        "记录持久化在 SQLite 中，进程重启后仍可查询、续报、续排与结算。"
+    ),
+    version="1.4.0",
+)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """把 Pydantic 校验错误整理成一条可读的中文原因。"""
+    reasons = []
+    for err in exc.errors():
+        loc = ".".join(str(p) for p in err.get("loc", ()) if p not in ("body",))
+        msg = err.get("msg", "参数不合法")
+        reasons.append(f"{loc + ': ' if loc else ''}{msg}")
+    reason = "；".join(reasons) if reasons else "请求参数不合法"
+    return JSONResponse(
+        status_code=422,
+        content={"error": "invalid_input", "reason": reason},
+    )
+
+
+@app.exception_handler(InfeasibleError)
+async def infeasible_exception_handler(request: Request, exc: InfeasibleError):
+    return JSONResponse(
+        status_code=422,
+        content={"error": "infeasible", "reason": str(exc)},
+    )
+
+
+@app.exception_handler(SettlementError)
+async def settlement_error_handler(request: Request, exc: SettlementError):
+    return JSONResponse(
+        status_code=422,
+        content={"error": exc.code, "reason": str(exc)},
+    )
+
+
+@app.exception_handler(ReplanError)
+async def replan_error_handler(request: Request, exc: ReplanError):
+    return JSONResponse(
+        status_code=422,
+        content={"error": exc.code, "reason": str(exc)},
+    )
+
+
+@app.exception_handler(SessionError)
+async def session_error_handler(request: Request, exc: SessionError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.code, "reason": str(exc)},
+    )
+
+
+@app.exception_handler(ValueError)
+async def value_error_handler(request: Request, exc: ValueError):
+    return JSONResponse(
+        status_code=422,
+        content={"error": "invalid_input", "reason": str(exc)},
+    )
+
+
+@app.get("/healthz", tags=["meta"])
+async def healthz():
+    return {"status": "ok"}
+
+
+@app.post(
+    "/dispatch",
+    response_model=DispatchResponse,
+    responses={422: {"model": ErrorResponse, "description": "非法输入或问题无解"}},
+    tags=["dispatch"],
+)
+async def dispatch(req: DispatchRequest) -> DispatchResponse:
+    result = solve_dispatch(
+        prices=req.prices,
+        base_load_kw=req.base_load_kw,
+        pv_kw=req.pv_kw,
+        capacity_kwh=req.capacity_kwh,
+        max_charge_kw=req.max_charge_kw,
+        max_discharge_kw=req.max_discharge_kw,
+        charge_efficiency=req.charge_efficiency,
+        discharge_efficiency=req.discharge_efficiency,
+        initial_soc_kwh=req.initial_soc_kwh,
+        min_terminal_soc_kwh=req.min_terminal_soc_kwh,
+        degradation_cost=req.degradation_cost_per_kwh,
+    )
+    return DispatchResponse.model_validate(result)
+
+
+@app.post(
+    "/telemetry/audit",
+    response_model=TelemetryAuditResponse,
+    responses={422: {"model": ErrorResponse, "description": "非法输入"}},
+    tags=["telemetry"],
+)
+async def telemetry_audit(req: TelemetryAuditRequest) -> TelemetryAuditResponse:
+    """核对实测记录的能量守恒与购电量一致性；异常记录照常返回 200 与分项残差。"""
+    result = audit_telemetry(
+        charge_efficiency=req.charge_efficiency,
+        discharge_efficiency=req.discharge_efficiency,
+        energy_tolerance_kwh=req.energy_tolerance_kwh,
+        records=req.records,
+    )
+    return TelemetryAuditResponse.model_validate(result)
+
+
+@app.post(
+    "/dispatch/settlement",
+    response_model=SettlementResponse,
+    responses={422: {"model": ErrorResponse, "description": "非法输入或结算整体拒绝"}},
+    tags=["settlement"],
+)
+async def dispatch_settlement(req: SettlementRequest) -> SettlementResponse:
+    """计划执行结算：重算校验快照 → 遥测审计 → SOC 轨迹核对 → 有效前缀计费。
+
+    - 计划快照与重算不一致（plan_snapshot_mismatch）、记录长度不符
+      （settlement_length_mismatch）、无有效区间（no_valid_interval）均整体拒绝；
+    - 存在异常/SOC 断点时不报错，返回 status=partially_settled 与首个异常下标。
+    """
+    result = execute_settlement(
+        dispatch_input=req.dispatch.model_dump(),
+        plan_snapshot=req.plan_snapshot.model_dump(),
+        settlement_tolerance_kwh=req.settlement_tolerance_kwh,
+        records=req.records,
+    )
+    return SettlementResponse.model_validate(result)
+
+
+@app.post(
+    "/dispatch/replan",
+    response_model=ReplanResponse,
+    responses={422: {"model": ErrorResponse, "description": "非法输入、快照不符、前缀异常或余段无解"}},
+    tags=["replan"],
+)
+async def dispatch_replan(req: ReplanRequest) -> ReplanResponse:
+    """计划执行中途按实测状态续排。
+
+    - 先重算并核对原计划快照，再按现有遥测审计规则核对连续实测前缀；
+      首条记录首态 SOC 须在审计容差内接原初值；
+    - 已执行动作即使偏离旧计划，只要实测自洽即保留原记录，从实测末态重排余段；
+    - 前缀异常（prefix_audit_failed）、末态不在 0.1kWh 网格（prefix_soc_off_grid）、
+      原末端 SOC 约束从实测末态已无法满足（infeasible）时整体拒绝。
+    """
+    result = execute_replan(
+        dispatch_input=req.dispatch.model_dump(),
+        plan_snapshot=req.plan_snapshot.model_dump(),
+        audit_tolerance_kwh=req.audit_tolerance_kwh,
+        executed_records=req.executed_records,
+        remaining_prices=req.remaining_prices,
+        remaining_base_load_kw=req.remaining_base_load_kw,
+        remaining_pv_kw=req.remaining_pv_kw,
+    )
+    return ReplanResponse.model_validate(result)
+
+
+@app.post(
+    "/dispatch/sessions",
+    response_model=SessionCreateResponse,
+    responses={422: {"model": ErrorResponse, "description": "非法输入、快照不符或重算无解"}},
+    tags=["sessions"],
+)
+async def create_dispatch_session(req: SessionCreateRequest) -> SessionCreateResponse:
+    """创建可持久接续的执行会话。
+
+    - 提交原 /dispatch 输入、完整计划快照与审计容差；服务端先重算并逐字段核对快照，
+      不一致（plan_snapshot_mismatch）或重算无解（infeasible）时不创建会话；
+    - 会话与后续已确认记录持久化到 SQLite，进程重启后仍在。
+    """
+    result = create_session(
+        dispatch=req.dispatch.model_dump(),
+        plan_snapshot=req.plan_snapshot.model_dump(),
+        audit_tolerance_kwh=req.audit_tolerance_kwh,
+    )
+    return SessionCreateResponse.model_validate(result)
+
+
+@app.post(
+    "/dispatch/sessions/{session_id}/batches",
+    response_model=BatchAppendResponse,
+    responses={
+        404: {"model": ErrorResponse, "description": "会话不存在"},
+        409: {"model": ErrorResponse, "description": "同起点内容不同的重复/并发上报冲突"},
+        422: {"model": ErrorResponse, "description": "非法输入、下标跳跃、越界、首态不接或批内审计异常"},
+    },
+    tags=["sessions"],
+)
+async def append_session_batch(
+    session_id: str, req: BatchAppendRequest
+) -> BatchAppendResponse:
+    """按时段下标成批追加半小时实测记录。
+
+    - start_index 必须等于会话 next_index（首批为 0），不得跳跃、不得越出计划范围；
+    - 首批首态 SOC 须在审计容差内接原初始 SOC，后续批次首态接已保存末态；
+      批内沿用遥测审计逐条核对，动作偏离计划但自洽时仍接受；
+    - 任一记录异常、下标跳跃或越界时整批不入库；
+    - 同起点已保存整批原样重试 → result=deduped 返回既有结果；
+      同起点内容不同 → 409 conflict，已保存的一份继续生效。
+    """
+    result = append_batch(
+        session_id=session_id,
+        start_index=req.start_index,
+        raw_records=[rec.model_dump() for rec in req.records],
+    )
+    return BatchAppendResponse.model_validate(result)
+
+
+@app.get(
+    "/dispatch/sessions",
+    response_model=SessionListResponse,
+    tags=["sessions"],
+)
+async def list_dispatch_sessions() -> SessionListResponse:
+    """列出全部执行会话概览（创建时间升序）。"""
+    return SessionListResponse.model_validate(list_sessions())
+
+
+@app.get(
+    "/dispatch/sessions/{session_id}",
+    response_model=SessionDetailResponse,
+    responses={404: {"model": ErrorResponse, "description": "会话不存在"}},
+    tags=["sessions"],
+)
+async def get_dispatch_session(session_id: str) -> SessionDetailResponse:
+    """查询会话：原计划信息（dispatch + plan_snapshot）、连续已确认记录（含逐条审计）
+    与下一下标。未完成前缀可直接取 confirmed_records 用于 /dispatch/replan；
+    满期（status=complete）记录可用于 /dispatch/settlement。"""
+    result = get_session(session_id)
+    return SessionDetailResponse.model_validate(result)
