@@ -6,7 +6,11 @@
 - 所有写事务走 process 内 RLock + BEGIN IMMEDIATE：同一进程的并发上报在
   临界区内串行判定，只有一份能写入；SQLite 文件锁同时防多进程抢写；
 - 记录按 (session_id, idx) 主键落库，天然防重复下标；整批 INSERT 在同一
-  事务内，任一条失败即回滚，满足「整批不入库」。
+  事务内，任一条失败即回滚，满足「整批不入库」；
+- session_batches 记录每批边界（起点、长度）、规范化记录与首次成功回执，
+  与该批逐段记录在同一写事务内确认：重试只有起点/长度/内容完全命中某行
+  才判 deduped，回执取冻结值；表以 CREATE TABLE IF NOT EXISTS 自动补建，
+  旧库逐段记录原样保留，历史区间不按前缀猜测去重。
 """
 
 from __future__ import annotations
@@ -18,6 +22,11 @@ from contextlib import contextmanager
 from typing import Iterator, List, Optional
 
 # 单条记录为半小时实测，计划最长 200 段，记录列只存 JSON，无需额外规模设计。
+# session_batches 记录批次边界（起点、长度）、本批规范化记录与首次成功回执：
+# 重试只有「起点 + 长度 + 内容」与某行完全一致才判 deduped，且回执取首次成功时
+# 冻结的值。表随 CREATE TABLE IF NOT EXISTS 在打开旧库时自动补建（迁移），
+# 旧库逐段记录原样保留：查询与按 next_index 续报照常，但历史区间没有批次边界，
+# 不会按前缀猜测去重。
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
@@ -33,6 +42,16 @@ CREATE TABLE IF NOT EXISTS session_records (
     record_json TEXT NOT NULL,
     stored_at TEXT NOT NULL,
     PRIMARY KEY (session_id, idx),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+);
+CREATE TABLE IF NOT EXISTS session_batches (
+    session_id TEXT NOT NULL,
+    start_index INTEGER NOT NULL,
+    batch_size INTEGER NOT NULL,
+    records_json TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    stored_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, start_index),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 """
@@ -140,17 +159,6 @@ class SessionStore:
         ).fetchone()
         return int(row["c"])
 
-    def get_records_from(
-        self, conn: sqlite3.Connection, session_id: str, start_index: int
-    ) -> List[sqlite3.Row]:
-        return list(
-            conn.execute(
-                "SELECT idx, record_json FROM session_records "
-                "WHERE session_id = ? AND idx >= ? ORDER BY idx",
-                (session_id, start_index),
-            ).fetchall()
-        )
-
     def get_all_records(self, session_id: str) -> List[sqlite3.Row]:
         with self._lock, self._connect() as conn:
             return list(
@@ -174,6 +182,44 @@ class SessionStore:
             " VALUES (?, ?, ?, ?)",
             (session_id, idx, record_json, stored_at),
         )
+
+    def get_batch(
+        self, conn: sqlite3.Connection, session_id: str, start_index: int
+    ) -> Optional[sqlite3.Row]:
+        """按精确起点取已确认批次（边界 + 内容 + 首次成功回执）；无该起点批次返回 None。"""
+        return conn.execute(
+            "SELECT start_index, batch_size, records_json, receipt_json, stored_at "
+            "FROM session_batches WHERE session_id = ? AND start_index = ?",
+            (session_id, start_index),
+        ).fetchone()
+
+    def insert_batch(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        start_index: int,
+        batch_size: int,
+        records_json: str,
+        receipt_json: str,
+        stored_at: str,
+    ) -> None:
+        """批次边界与首次回执落库；与同事务的 session_records 插入一起原子确认。"""
+        conn.execute(
+            "INSERT INTO session_batches"
+            "(session_id, start_index, batch_size, records_json, receipt_json, stored_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, start_index, batch_size, records_json, receipt_json, stored_at),
+        )
+
+    def get_last_record_row(
+        self, conn: sqlite3.Connection, session_id: str
+    ) -> Optional[sqlite3.Row]:
+        """写事务内取已保存末条记录（用于下一批首态衔接与累计末态）。"""
+        return conn.execute(
+            "SELECT idx, record_json FROM session_records "
+            "WHERE session_id = ? ORDER BY idx DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
 
 
 _store: Optional[SessionStore] = None

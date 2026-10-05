@@ -564,20 +564,22 @@ class BatchAppendResponse(BaseModel):
     start_index: int = Field(description="本批起始下标（与请求一致）")
     batch_size: int = Field(description="本批记录条数")
     result: Literal["accepted", "deduped"] = Field(
-        description="accepted=新批次已入库；deduped=同起点同内容重试，原样返回既有结果"
+        description="accepted=新批次已入库；deduped=起点/长度/内容与已确认整批完全一致的原样重试，"
+        "不重复入库"
     )
     confirmed_periods: int = Field(description="入库/已确认后会话的累计确认时段数")
     next_index: int = Field(description="下一批应使用的起始下标")
     status: Literal["awaiting_records", "in_progress", "complete"]
     batch_audit: List[BatchAuditRecord] = Field(
-        description="本批记录的遥测审计逐条结论（deduped 时为已保存批次的同一审计结果）"
+        description="本批记录的遥测审计逐条结论（deduped 时为该批首次成功时保存的同一审计结果）"
     )
     first_record_soc_gap_kwh: float = Field(
-        description="本批首态 SOC 与应有起点之差："
-        "首批接原初始 SOC，后续批接已保存末态（deduped 同样重算返回）"
+        description="本批首态 SOC 与应有起点之差：首批接原初始 SOC，后续批接已保存末态；"
+        "deduped 时保持该批首次成功时的值"
     )
     final_soc_kwh: Optional[float] = Field(
-        description="截至本批的已确认末态 SOC（无记录时为 null）"
+        description="本批首次成功确认后的已确认末态 SOC（无记录时为 null）；"
+        "deduped 时保持该批首次成功时的值，不反映后续批次的最新末态"
     )
 
 
