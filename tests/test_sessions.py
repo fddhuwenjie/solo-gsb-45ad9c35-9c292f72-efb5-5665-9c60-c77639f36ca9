@@ -2,6 +2,7 @@
 
 import copy
 import json
+import sqlite3
 import threading
 
 import pytest
@@ -294,6 +295,89 @@ def test_identical_retry_returns_existing_result():
     assert again_last["status"] == "complete"
 
 
+def test_short_prefix_retry_is_conflict_not_deduped():
+    """同起点短批（只重发已确认整批的前几条）→ 409 conflict，不得误判 deduped。"""
+    sid = _create()["session_id"]
+    first = _append(sid, 0, RECORDS[:2]).json()
+    assert first["result"] == "accepted"
+
+    # 只重发第一条：起点相同但长度不符，不是已确认整批
+    r = _append(sid, 0, RECORDS[:1])
+    assert r.status_code == 409
+    assert r.json()["error"] == "conflict"
+    assert "next_index=2" in r.json()["reason"]
+
+    # 同起点更长的批（含未确认下标）同样冲突
+    r = _append(sid, 0, RECORDS[:3])
+    assert r.status_code == 409
+    assert r.json()["error"] == "conflict"
+
+    # 记录与进度不变；完整首批原样重试仍幂等
+    d = client.get(f"/dispatch/sessions/{sid}").json()
+    assert d["confirmed_periods"] == 2
+    assert d["next_index"] == 2
+    again = _append(sid, 0, copy.deepcopy(RECORDS[:2])).json()
+    assert again["result"] == "deduped"
+
+
+def test_retry_after_later_batches_returns_frozen_receipt():
+    """后续批次入库后重发完整首批：deduped 且回执保持该批首次成功时的值。"""
+    sid = _create()["session_id"]
+    first = _append(sid, 0, RECORDS[:2]).json()
+    assert first["confirmed_periods"] == 2
+    assert first["status"] == "in_progress"
+    assert first["final_soc_kwh"] == 0.1
+
+    # 追加第二批至满期，会话进度与末态已推进
+    last = _append(sid, 2, RECORDS[2:]).json()
+    assert last["status"] == "complete"
+
+    # 重发完整首批：除 result 外全部字段与首收回执一致，不漂移到最新进度
+    again = _append(sid, 0, copy.deepcopy(RECORDS[:2])).json()
+    assert again["result"] == "deduped"
+    for key in (
+        "session_id", "start_index", "batch_size", "confirmed_periods",
+        "next_index", "status", "batch_audit", "first_record_soc_gap_kwh",
+        "final_soc_kwh",
+    ):
+        assert again[key] == first[key], key
+
+    # 第二批重发同样冻结在其首收回执（complete）
+    again_last = _append(sid, 2, copy.deepcopy(RECORDS[2:])).json()
+    assert again_last["result"] == "deduped"
+    for key in ("confirmed_periods", "next_index", "status", "batch_audit", "final_soc_kwh"):
+        assert again_last[key] == last[key], key
+
+
+def test_cross_batch_concatenation_conflict():
+    """跨批拼接（覆盖多个已确认批次）→ 409 conflict，记录与进度不变。"""
+    sid = _create()["session_id"]
+    assert _append(sid, 0, RECORDS[:2]).status_code == 200
+    assert _append(sid, 2, RECORDS[2:]).status_code == 200
+
+    # [0,4) 拼接两个已确认批次：起点 0 的已确认批次长度为 2，不等于 4
+    r = _append(sid, 0, RECORDS)
+    assert r.status_code == 409
+    assert r.json()["error"] == "conflict"
+
+    # [0,3) 跨批短拼接同样冲突
+    r = _append(sid, 0, RECORDS[:3])
+    assert r.status_code == 409
+
+    # 从批中起点（非批次边界）上报也冲突
+    r = _append(sid, 1, RECORDS[1:3])
+    assert r.status_code == 409
+
+    d = client.get(f"/dispatch/sessions/{sid}").json()
+    assert d["confirmed_periods"] == 4
+    assert d["next_index"] == 4
+    assert d["status"] == "complete"
+
+    # 两个已确认整批各自原样重试仍幂等
+    assert _append(sid, 0, copy.deepcopy(RECORDS[:2])).json()["result"] == "deduped"
+    assert _append(sid, 2, copy.deepcopy(RECORDS[2:])).json()["result"] == "deduped"
+
+
 def test_same_start_different_content_conflict():
     """同起点内容不同（含部分重叠）→ 409 conflict，已保存一份继续生效。"""
     sid = _create()["session_id"]
@@ -423,6 +507,153 @@ def test_persistence_across_restart(tmp_path):
     tail = _append(sid, 2, RECORDS[2:])
     assert tail.status_code == 200
     assert tail.json()["status"] == "complete"
+
+
+def test_frozen_receipt_survives_restart_and_later_batches(tmp_path):
+    """重启与后续批次入库后重试：仍返回该批首次成功时冻结的回执。"""
+    db_path = str(tmp_path / "receipts.db")
+    configure_store(db_path)
+    sid = _create()["session_id"]
+    first = _append(sid, 0, RECORDS[:2]).json()
+
+    configure_store(db_path)  # 模拟重启
+    assert _append(sid, 2, RECORDS[2:]).json()["status"] == "complete"
+
+    configure_store(db_path)  # 再次重启
+    again = _append(sid, 0, copy.deepcopy(RECORDS[:2])).json()
+    assert again["result"] == "deduped"
+    for key in (
+        "confirmed_periods", "next_index", "status",
+        "batch_audit", "first_record_soc_gap_kwh", "final_soc_kwh",
+    ):
+        assert again[key] == first[key], key
+    # 会话实际进度仍是满期（回执冻结不等于进度回退）
+    d = client.get(f"/dispatch/sessions/{sid}").json()
+    assert d["confirmed_periods"] == 4
+    assert d["status"] == "complete"
+
+
+def test_legacy_db_without_batch_boundaries(tmp_path):
+    """旧库只有逐段记录（无批次边界表数据）：查询与从 next_index 续报保留；
+    无法确认历史批次边界时不按前缀猜测去重，重叠上报一律 409。"""
+    db_path = str(tmp_path / "legacy.db")
+    plan = _plan()
+
+    # 手工构造旧版库：只有 sessions / session_records 两张表与逐段记录
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE sessions (
+            session_id TEXT PRIMARY KEY,
+            dispatch_json TEXT NOT NULL,
+            plan_snapshot_json TEXT NOT NULL,
+            audit_tolerance_kwh REAL NOT NULL,
+            num_periods INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE session_records (
+            session_id TEXT NOT NULL,
+            idx INTEGER NOT NULL,
+            record_json TEXT NOT NULL,
+            stored_at TEXT NOT NULL,
+            PRIMARY KEY (session_id, idx)
+        );
+        """
+    )
+    sid = "legacy-session-id"
+    conn.execute(
+        "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?)",
+        (sid, json.dumps(DISPATCH), json.dumps(plan), TOL, 4, "2026-01-01T00:00:00Z"),
+    )
+    for idx, rec in enumerate(RECORDS[:2]):
+        conn.execute(
+            "INSERT INTO session_records VALUES (?, ?, ?, ?)",
+            (sid, idx, json.dumps(rec), "2026-01-01T00:00:01Z"),
+        )
+    conn.commit()
+    conn.close()
+
+    configure_store(db_path)  # 新版代码打开旧库：批次表自动补建为空表
+
+    # 查询能力保留：原计划、连续记录、下一下标都在
+    d = client.get(f"/dispatch/sessions/{sid}").json()
+    assert d["confirmed_periods"] == 2
+    assert d["next_index"] == 2
+    assert d["status"] == "in_progress"
+    assert [r["index"] for r in d["confirmed_records"]] == [0, 1]
+
+    # 历史批次边界无法确认：即使内容与已保存记录逐条相同也不去重 → 409
+    r = _append(sid, 0, copy.deepcopy(RECORDS[:2]))
+    assert r.status_code == 409
+    assert r.json()["error"] == "conflict"
+    r = _append(sid, 0, RECORDS[:1])
+    assert r.status_code == 409
+
+    # 从 next_index 续报能力保留：新批次正常入库并登记边界
+    r = _append(sid, 2, RECORDS[2:])
+    assert r.status_code == 200, r.text
+    assert r.json()["result"] == "accepted"
+    assert r.json()["status"] == "complete"
+
+    # 新批次的边界已确认：原样重试幂等，回执冻结
+    tail = r.json()
+    again = _append(sid, 2, copy.deepcopy(RECORDS[2:])).json()
+    assert again["result"] == "deduped"
+    assert again["confirmed_periods"] == tail["confirmed_periods"] == 4
+    assert client.get(f"/dispatch/sessions/{sid}").json()["confirmed_periods"] == 4
+
+
+def test_cross_process_concurrent_append(tmp_path):
+    """跨进程并发同起点上报：内容相同 → accepted+deduped；内容不同 → 仅一份生效。"""
+    import multiprocessing
+
+    def worker(db_path, sid, records, queue):
+        from app.sessions import append_batch as _append_batch
+        from app.storage import configure_store as _configure
+
+        _configure(db_path)
+        try:
+            r = _append_batch(sid, 0, records)
+            queue.put(r["result"])
+        except Exception as exc:  # noqa: BLE001
+            queue.put(getattr(exc, "code", "error"))
+
+    def run_race(records_list):
+        db_path = str(tmp_path / f"xproc-{len(records_list)}-{run_race.n}.db")
+        run_race.n += 1
+        configure_store(db_path)
+        sid = _create()["session_id"]
+        ctx = multiprocessing.get_context("fork")
+        queue = ctx.Queue()
+        procs = [
+            ctx.Process(target=worker, args=(db_path, sid, copy.deepcopy(recs), queue))
+            for recs in records_list
+        ]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(30)
+            assert p.exitcode == 0
+        outcomes = sorted(queue.get() for _ in procs)
+        configure_store(db_path)  # 主进程重新打开，核对落库结果
+        return outcomes, sid
+
+    run_race.n = 0
+
+    # 同内容并发：恰好一个 accepted，其余 deduped（同一冻结回执）
+    outcomes, sid = run_race([RECORDS[:2], RECORDS[:2]])
+    assert outcomes == ["accepted", "deduped"]
+    assert client.get(f"/dispatch/sessions/{sid}").json()["confirmed_periods"] == 2
+
+    # 不同内容并发：恰好一个 accepted，其余 conflict，记录与进度不变
+    alt = copy.deepcopy(RECORDS[:2])
+    alt[1]["grid_purchase_energy_kwh"] = 0.012
+    outcomes, sid = run_race([RECORDS[:2], alt])
+    assert outcomes == ["accepted", "conflict"]
+    d = client.get(f"/dispatch/sessions/{sid}").json()
+    assert d["confirmed_periods"] == 2
+    saved = d["confirmed_records"][1]["record"]["grid_purchase_energy_kwh"]
+    assert saved in (0.01, 0.012)  # 只有一份生效，且与 accepted 的那份一致
 
 
 def test_unfinished_prefix_feeds_replan():

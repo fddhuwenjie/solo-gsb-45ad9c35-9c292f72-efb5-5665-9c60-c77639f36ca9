@@ -6,7 +6,15 @@
 - 所有写事务走 process 内 RLock + BEGIN IMMEDIATE：同一进程的并发上报在
   临界区内串行判定，只有一份能写入；SQLite 文件锁同时防多进程抢写；
 - 记录按 (session_id, idx) 主键落库，天然防重复下标；整批 INSERT 在同一
-  事务内，任一条失败即回滚，满足「整批不入库」。
+  事务内，任一条失败即回滚，满足「整批不入库」；
+- session_batches 按 (session_id, start_index) 主键记录每个已确认批次的
+  边界（start_index + batch_size）与首次成功时的完整回执（receipt_json），
+  与逐段记录在同一写事务内落库：重试判定以批次边界为准，只有起点、长度、
+  内容三者都与某已确认整批一致才算原样重试（deduped），且回执保持首次
+  成功时的值不随后续批次漂移；
+- 旧库只有 sessions / session_records 两张表时，session_batches 由
+  CREATE TABLE IF NOT EXISTS 自动补齐（空表）：查询与从 next_index 续报
+  不受影响；已确认区间内没有批次边界可核对，不按前缀猜测去重。
 """
 
 from __future__ import annotations
@@ -18,6 +26,7 @@ from contextlib import contextmanager
 from typing import Iterator, List, Optional
 
 # 单条记录为半小时实测，计划最长 200 段，记录列只存 JSON，无需额外规模设计。
+# session_batches 为批次边界与首收回执表：后加的新表，旧库打开时由 IF NOT EXISTS 自动补建。
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
@@ -33,6 +42,15 @@ CREATE TABLE IF NOT EXISTS session_records (
     record_json TEXT NOT NULL,
     stored_at TEXT NOT NULL,
     PRIMARY KEY (session_id, idx),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+);
+CREATE TABLE IF NOT EXISTS session_batches (
+    session_id TEXT NOT NULL,
+    start_index INTEGER NOT NULL,
+    batch_size INTEGER NOT NULL,
+    receipt_json TEXT NOT NULL,
+    stored_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, start_index),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 """
@@ -173,6 +191,33 @@ class SessionStore:
             "INSERT INTO session_records(session_id, idx, record_json, stored_at)"
             " VALUES (?, ?, ?, ?)",
             (session_id, idx, record_json, stored_at),
+        )
+
+    def get_batch(
+        self, conn: sqlite3.Connection, session_id: str, start_index: int
+    ) -> Optional[sqlite3.Row]:
+        """取 start_index 处已确认批次的边界与首收回执；无边界记录返回 None。"""
+        return conn.execute(
+            "SELECT start_index, batch_size, receipt_json, stored_at FROM session_batches "
+            "WHERE session_id = ? AND start_index = ?",
+            (session_id, start_index),
+        ).fetchone()
+
+    def insert_batch(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        start_index: int,
+        batch_size: int,
+        receipt_json: str,
+        stored_at: str,
+    ) -> None:
+        """与逐段记录同一事务写入批次边界与首次成功回执（重试时原样取回）。"""
+        conn.execute(
+            "INSERT INTO session_batches"
+            "(session_id, start_index, batch_size, receipt_json, stored_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (session_id, start_index, batch_size, receipt_json, stored_at),
         )
 
 

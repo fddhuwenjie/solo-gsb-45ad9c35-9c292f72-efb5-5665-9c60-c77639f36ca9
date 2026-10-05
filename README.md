@@ -1,6 +1,6 @@
 # 家庭储能时段调度 API
 
-基于 **Python + FastAPI + Pydantic** 的家庭储能调度服务。输入等长的半小时电价、基础负荷、光伏预测序列以及电池参数，用**动态规划（SOC 离散到 0.1 kWh）**求出满足功率、SOC 和末端 SOC 约束的**最低总成本**充放电计划；另提供 `/telemetry/audit` 对半小时实测记录做能量守恒与购电量**审计**（只核对标记，不修正读数、不生成调度计划）；`/dispatch/settlement` 对一份已下发计划做**执行结算**：携带原始 `/dispatch` 输入与计划快照，服务重算校验快照未被篡改、复用遥测审计逐条核对，并只对首个异常 / SOC 断点之前的连续有效区间按实测购电量与吞吐量计费；`/dispatch/replan` 支持计划**执行到中途**时依据连续实测前缀**续排**：核对原计划与前缀审计、保留实测原记录并从实测末态重排余段，同时返回可直接交给结算接口的余段调度输入与计划快照。`/dispatch/sessions` 进一步提供**可持久接续的执行会话**：实测记录可分多批到达，创建会话时提交原 `/dispatch` 输入、完整计划快照与审计容差（先重算确认快照一致），之后按时段下标成批追加记录，首批首态接原初始 SOC、后续批次首态接已保存末态，沿用现有遥测审计逐段核对且**整批原子入库**；同一起点原样重试幂等、内容不同的并发上报只有一份生效；会话与记录落在 **SQLite（命名卷）**，进程重启后仍可查询、续报，未完成前缀可直接续排、满期记录可直接结算。
+基于 **Python + FastAPI + Pydantic** 的家庭储能调度服务。输入等长的半小时电价、基础负荷、光伏预测序列以及电池参数，用**动态规划（SOC 离散到 0.1 kWh）**求出满足功率、SOC 和末端 SOC 约束的**最低总成本**充放电计划；另提供 `/telemetry/audit` 对半小时实测记录做能量守恒与购电量**审计**（只核对标记，不修正读数、不生成调度计划）；`/dispatch/settlement` 对一份已下发计划做**执行结算**：携带原始 `/dispatch` 输入与计划快照，服务重算校验快照未被篡改、复用遥测审计逐条核对，并只对首个异常 / SOC 断点之前的连续有效区间按实测购电量与吞吐量计费；`/dispatch/replan` 支持计划**执行到中途**时依据连续实测前缀**续排**：核对原计划与前缀审计、保留实测原记录并从实测末态重排余段，同时返回可直接交给结算接口的余段调度输入与计划快照。`/dispatch/sessions` 进一步提供**可持久接续的执行会话**：实测记录可分多批到达，创建会话时提交原 `/dispatch` 输入、完整计划快照与审计容差（先重算确认快照一致），之后按时段下标成批追加记录，首批首态接原初始 SOC、后续批次首态接已保存末态，沿用现有遥测审计逐段核对且**整批原子入库**；批次边界与首次回执随记录同事务落库，**起点、长度、内容都与某已确认整批一致**的重试幂等返回该批首收回执（不随后续批次漂移），短批、内容变更或跨批拼接等重叠上报一律 409、只有一份生效；会话与记录落在 **SQLite（命名卷）**，进程重启后仍可查询、续报，未完成前缀可直接续排、满期记录可直接结算。
 
 ## 一条命令启动
 
@@ -564,8 +564,8 @@ curl -s -X POST http://localhost:8000/dispatch/replan \
 1. **下标衔接**：`start_index` 必须等于会话当前 `next_index`（首批为 0），下标跳跃（`batch_index_gap`）或区间超出 `[0, num_periods)`（`batch_out_of_range`）都**整批不入库**；
 2. **首态衔接**：首批首态 SOC 须在容差内接**原初始 SOC**；后续批次首态 SOC 须在容差内接**已保存最后一条的末态 SOC**（`batch_boundary_gap` 整批不入库）；
 3. **逐段审计**：沿用现有 `audit_telemetry` 核对批内每条记录的电芯能量守恒、购电量平衡与相邻记录 SOC 衔接；实测动作**偏离计划但自洽时仍接受**（会话不做计划 SOC 轨迹核对，偏离不是异常）；任一条异常（`batch_audit_failed`）都**整批不入库**，原因中点名首个异常下标与残差；
-4. **原子入库**：上述检查全部通过后整批写入同一 SQLite 事务，返回 `result=accepted`、更新后的 `confirmed_periods` / `next_index` / `status`（`awaiting_records` → `in_progress` → `complete`）、本批逐条 `batch_audit`、`first_record_soc_gap_kwh` 与累计 `final_soc_kwh`；
-5. **重试与冲突**：同一起点的**已保存整批原样重试**（记录逐条相同）→ HTTP 200、`result=deduped`，原样返回既有审计结果且不重复入库；同起点**内容不同**的上报（含部分重叠与并发上报）→ **HTTP 409 `conflict`**，已保存的一份继续生效，响应原因中给出当前 `next_index`。
+4. **原子入库**：上述检查全部通过后，整批记录、批次边界（`start_index` + 批长）与**首次成功回执**在同一 SQLite 写事务内确认，返回 `result=accepted`、更新后的 `confirmed_periods` / `next_index` / `status`（`awaiting_records` → `in_progress` → `complete`）、本批逐条 `batch_audit`、`first_record_soc_gap_kwh` 与累计 `final_soc_kwh`；
+5. **重试与冲突**：重试判定以持久化的批次边界为准——**起点、长度、内容三者都与某个已确认整批一致**才算原样重试 → HTTP 200、`result=deduped`，**除 `result` 外其余字段保持该批首次成功时的值**（`confirmed_periods` / `next_index` / `status` / `final_soc_kwh` 等不随后续批次入库而漂移），且不重复入库；**同起点短批、内容变更、跨批拼接**，或落在已确认区间内却没有匹配批次边界的上报（含并发上报）→ **HTTP 409 `conflict`**，已保存记录与进度不变，响应原因中给出当前 `next_index`。跨进程并发、进程重启、后续批次入库后的重试都遵守同一套规则；旧库只有逐段记录、无法确认历史批次边界时，查询与从 `next_index` 续报照常可用，但重叠上报一律 409，**不按前缀猜测去重**。
 
 ### `GET /dispatch/sessions/{session_id}` 与 `GET /dispatch/sessions`
 
@@ -573,7 +573,7 @@ curl -s -X POST http://localhost:8000/dispatch/replan \
 
 ### 持久化
 
-会话与记录存放在容器内 `/data/sessions.db`（SQLite，环境变量 `DISPATCH_SESSION_DB` 可覆盖路径），Compose 已把命名卷 `dispatch-session-data` 挂到 `/data`：容器重建、镜像升级或进程重启后，会话与已确认记录**原样保留**，可继续查询、幂等重试与续报。裸机运行时若 `/data` 不可写，自动落到工作目录 `./data/sessions.db`。
+会话、逐段记录、批次边界与首次回执存放在容器内 `/data/sessions.db`（SQLite，环境变量 `DISPATCH_SESSION_DB` 可覆盖路径），Compose 已把命名卷 `dispatch-session-data` 挂到 `/data`：容器重建、镜像升级或进程重启后，会话与已确认记录**原样保留**，可继续查询、幂等重试与续报。裸机运行时若 `/data` 不可写，自动落到工作目录 `./data/sessions.db`。旧版本库（只有逐段记录、无批次边界表）打开时自动补建新表：查询与从 `next_index` 续报不受影响，历史区间因无法确认批次边界，重叠上报按 409 处理而不猜测去重。
 
 ### 可执行示例（创建、分批追加、重试、查询、续排/结算）
 
@@ -622,9 +622,16 @@ JSON
 curl -s -X POST $BASE/dispatch/sessions/$SID/batches -H 'Content-Type: application/json' \
   -d @/tmp/batch0.json | jq '{result, confirmed_periods, next_index, status, first_record_soc_gap_kwh}'
 
-# 3) 网络超时后原样重试同一起点同一批 → result=deduped，不重复入库
+# 3) 网络超时后原样重试同一起点同一批（起点、长度、内容都与已确认整批一致）
+#    → result=deduped，不重复入库，回执与首收时完全相同
 curl -s -X POST $BASE/dispatch/sessions/$SID/batches -H 'Content-Type: application/json' \
-  -d @/tmp/batch0.json | jq '{result, confirmed_periods, next_index}'
+  -d @/tmp/batch0.json | jq '{result, confirmed_periods, next_index, status, final_soc_kwh}'
+
+#    同起点短批（只重发第一条）不是已确认整批 → HTTP 409 conflict，记录与进度不变
+jq -c '{start_index: 0, records: [.records[0]]}' /tmp/batch0.json \
+  | curl -s -o /tmp/short.json -w '%{http_code}\n' \
+    -X POST $BASE/dispatch/sessions/$SID/batches -H 'Content-Type: application/json' -d @-
+jq .error /tmp/short.json   # "conflict"
 
 #    同起点但内容不同（哪怕只改一个读数）→ HTTP 409 conflict
 sed 's/"grid_purchase_energy_kwh": 0.01/"grid_purchase_energy_kwh": 0.012/' /tmp/batch0.json \
@@ -646,6 +653,18 @@ JSON
 curl -s -X POST $BASE/dispatch/sessions/$SID/batches -H 'Content-Type: application/json' \
   -d @/tmp/batch2.json | jq '{result, confirmed_periods, next_index, status}'
 # 若下标跳跃（如 start_index=3）或记录异常，会返回 422 且整批不入库，可修正后按 next_index 重发
+
+# 4b) 后续批次入库后再重发完整首批：仍返回该批首次成功时的回执
+#     （confirmed_periods=2、next_index=2、status=in_progress、final_soc_kwh=0.1），
+#     不漂移到最新进度；会话实际进度以查询接口为准
+curl -s -X POST $BASE/dispatch/sessions/$SID/batches -H 'Content-Type: application/json' \
+  -d @/tmp/batch0.json | jq '{result, confirmed_periods, next_index, status, final_soc_kwh}'
+
+#    跨批拼接（把两批合成一批重发）不等于任何已确认整批 → HTTP 409 conflict
+jq -s '{start_index: 0, records: (.[0].records + .[1].records)}' /tmp/batch0.json /tmp/batch2.json \
+  | curl -s -o /tmp/concat.json -w '%{http_code}\n' \
+    -X POST $BASE/dispatch/sessions/$SID/batches -H 'Content-Type: application/json' -d @-
+jq .error /tmp/concat.json   # "conflict"
 
 # 5) 查询会话：原计划 + 连续已确认记录 + 下一下标（重启后同样可查）
 curl -s $BASE/dispatch/sessions/$SID | tee /tmp/detail.json | jq \
@@ -669,7 +688,7 @@ jq -c '{dispatch, plan_snapshot, audit_tolerance_kwh,
   | jq '{executed_periods, remaining_periods, total_cost_yuan}'
 ```
 
-进程重启验证：`docker compose restart`（或 `docker compose down && docker compose up -d`，命名卷保留）后再次执行第 5 步，会话与已确认记录仍在；对已保存批次执行第 3 步仍返回 `deduped`。
+进程重启验证：`docker compose restart`（或 `docker compose down && docker compose up -d`，命名卷保留）后再次执行第 5 步，会话与已确认记录仍在；对已保存批次执行第 3、4b 步仍返回 `deduped`，且回执保持各批首次成功时的值。
 
 ## 模型与假设
 
@@ -740,11 +759,11 @@ jq -c '{dispatch, plan_snapshot, audit_tolerance_kwh,
 执行会话接口的错误码（除 `conflict` 为 **HTTP 409**、`session_not_found` 为 **HTTP 404** 外，其余为 422）：
 
 - `plan_snapshot_mismatch` / `infeasible`：创建会话时快照核对不一致 / 原输入重算无解，均不创建会话；
-- `batch_index_gap`：`start_index` 不等于会话 `next_index`（下标跳跃或重复上报已确认下标），整批不入库；
+- `batch_index_gap`：`start_index` 大于会话 `next_index`（下标跳跃），整批不入库；
 - `batch_out_of_range`：本批下标区间超出 `[0, num_periods)`，整批不入库；
 - `batch_boundary_gap`：首批首态未在容差内接原初始 SOC，或后续批首态未接已保存末态，整批不入库；
 - `batch_audit_failed`：批内任一条记录未通过遥测审计（原因点名首个异常下标），整批不入库；
-- `conflict`（409）：同起点已有确认记录且本次内容不同（含部分重叠、并发上报），已保存的一份继续生效；
+- `conflict`（409）：重叠上报未与某个已确认整批完全一致——同起点短批 / 长批、内容变更、跨批拼接、批中起点、并发上报，或旧库只有逐段记录而无法确认历史批次边界；已保存记录与进度不变，请按原因中的 `next_index` 续报；
 - `session_not_found`（404）：会话 ID 不存在；
 - `invalid_input`：容差为负 / 非有限、批为空或超长、测量值为负 / 非有限、SOC 超容量等。
 

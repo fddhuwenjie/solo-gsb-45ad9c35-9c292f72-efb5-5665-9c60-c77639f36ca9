@@ -10,19 +10,25 @@
    首批首态 SOC 须在容差内接原初始 SOC，后续批次首态须接已保存最后一条末态；
    批内记录动作偏离计划但自洽时仍接受（不做计划 SOC 轨迹核对）；
 4. 任一条记录异常、下标跳跃或超出计划范围时整批不入库；
-5. 同一起点已保存整批记录原样重试（内容逐条相同）→ 返回既有结果（deduped，
-   不重复入库）；同起点内容不同 → 409 conflict，已保存的一份继续生效；
-6. 进程重启后会话与记录仍在（SQLite 持久化）。
+5. 重试判定以持久化的批次边界为准：只有起点、长度、内容三者都与某个
+   已确认整批一致才算原样重试 → 返回该批首次成功时冻结的回执（仅 result
+   改为 deduped，confirmed_periods/next_index/status/final_soc_kwh 等
+   不随后续批次入库而漂移）；同起点短批、内容变更、跨批拼接或落在已确认
+   区间内却没有匹配批次边界的上报 → 409 conflict，已保存记录与进度不变；
+6. 批次边界、首次回执与逐段记录在同一 SQLite 写事务内确认，跨进程并发、
+   进程重启、后续批次入库后重试都遵守同一套规则；旧库只有逐段记录、无法
+   确认历史批次边界时，保留查询与从 next_index 续报能力，但不按前缀猜测
+   去重（重叠上报一律 409）。
 
 HTTP 错误码：
 - session_not_found：会话不存在（404）；
 - plan_snapshot_mismatch / infeasible：创建会话时快照核对或重算失败（422）；
 - invalid_input：容差/记录值非法等（422）；
-- batch_index_gap：start_index 不等于 next_index（422）；
+- batch_index_gap：start_index 大于 next_index（下标跳跃）（422）；
 - batch_out_of_range：本批超出计划时段范围（422）；
 - batch_boundary_gap：本批首态未在容差内接原初始 SOC / 已保存末态（422）；
 - batch_audit_failed：批内存在遥测审计异常（422）；
-- conflict：同起点内容不同的并发/重复上报（409）。
+- conflict：起点、长度、内容未与已确认整批完全一致的重叠上报（409）。
 """
 
 from __future__ import annotations
@@ -160,7 +166,12 @@ def append_batch(
     raw_records: List[dict],
     store: Optional[SessionStore] = None,
 ) -> dict:
-    """成批追加记录；查重、边界核对、审计、入库在同一写事务临界区内完成。"""
+    """成批追加记录；查重、边界核对、审计、入库在同一写事务临界区内完成。
+
+    重试语义：只有起点、长度、内容都与某个已确认整批完全一致才返回该批
+    首次成功时冻结的回执（result=deduped）；同起点短批、内容变更、跨批
+    拼接或旧库无法确认批次边界的重叠上报一律 409，记录与进度不变。
+    """
     store = store or get_store()
     session = _load_session(store, session_id)
     dispatch = session["dispatch"]
@@ -189,123 +200,124 @@ def append_batch(
         confirmed = store.count_records(conn, session_id)
         next_index = confirmed  # 记录自 0 连续保存，已确认条数即下一下标
 
-        # 同起点是否已有已保存记录（重复/并发上报判定）
-        overlap = store.get_records_from(conn, session_id, start_index)
-        if overlap:
-            saved_payload = [json.loads(row["record_json"]) for row in overlap[:batch_size]]
-            fully_covered = len(overlap) >= batch_size
-            if fully_covered and saved_payload == canonical:
-                # 原样重试：不重复入库，返回既有批次结果（审计可由记录确定性重算）
-                pass
-            else:
-                detail = (
-                    f"已保存区间只覆盖到下标 {start_index + len(overlap) - 1}"
-                    if not fully_covered
-                    else "同起点已保存批次的记录内容与本次上报不同"
+        # 以持久化的批次边界判定重试：起点、长度、内容三者都一致才算原样重试
+        batch_row = store.get_batch(conn, session_id, start_index)
+        if batch_row is not None:
+            saved_size = int(batch_row["batch_size"])
+            same_content = False
+            if saved_size == batch_size:
+                saved_rows = store.get_records_from(conn, session_id, start_index)
+                saved_payload = [
+                    json.loads(row["record_json"]) for row in saved_rows[:batch_size]
+                ]
+                same_content = (
+                    len(saved_payload) == batch_size and saved_payload == canonical
                 )
+            if saved_size == batch_size and same_content:
+                # 原样重试：不重复入库，返回该批首次成功时冻结的回执，
+                # 仅 result 改为 deduped，其余字段保持首收时的值
+                receipt = json.loads(batch_row["receipt_json"])
+                receipt["result"] = "deduped"
+                return receipt
+            detail = (
+                f"已确认批次长度为 {saved_size} 条，本次为 {batch_size} 条，"
+                "短批/长批/跨批拼接都不等同于已确认整批"
+                if saved_size != batch_size
+                else "同起点已确认批次的记录内容与本次上报不同"
+            )
+            raise SessionError(
+                "conflict",
+                f"下标 {start_index} 起已有确认批次（当前 next_index={next_index}）："
+                f"{detail}；已保存的一份继续生效，记录与进度不变，"
+                f"请以下标 {next_index} 续报",
+                409,
+            )
+
+        # 无批次边界记录：start_index 必须严格等于下一下标才允许入库
+        if start_index != next_index:
+            if start_index < next_index:
+                # 落在已确认区间内却没有匹配的批次边界（批中起点、跨批拼接，
+                # 或旧库只有逐段记录）：无法确认历史批次边界，不按前缀猜测去重
                 raise SessionError(
                     "conflict",
-                    f"下标 {start_index} 起已有确认记录（当前 next_index={next_index}）："
-                    f"{detail}；并发上报只有一份生效，请以下标 {next_index} 续报",
+                    f"下标 {start_index} 落在已确认区间 [0, {next_index}) 内，"
+                    "但没有起点相同的已确认批次可逐条核对（当前 "
+                    f"next_index={next_index}）：不按前缀猜测去重，"
+                    f"已保存记录与进度不变，请以下标 {next_index} 续报",
                     409,
                 )
+            raise SessionError(
+                "batch_index_gap",
+                f"起始下标 {start_index} 与已确认末态不衔接：期望 {next_index}，"
+                f"下标不允许跳跃，整批不入库",
+            )
+
+        # 边界衔接：首批接原初始 SOC，后续批接已保存最后一条末态
+        if next_index == 0:
+            expected_start = dispatch["initial_soc_kwh"]
+            anchor_desc = f"原初始 SOC {expected_start}kWh"
         else:
-            # 下标跳跃/重复：start_index 必须严格等于下一下标
-            if start_index != next_index:
-                if start_index < next_index:
-                    raise SessionError(
-                        "batch_index_gap",
-                        f"起始下标 {start_index} 已被确认记录覆盖（当前 next_index={next_index}），"
-                        "已保存区间只接受原样重试，整批不入库",
-                    )
-                raise SessionError(
-                    "batch_index_gap",
-                    f"起始下标 {start_index} 与已确认末态不衔接：期望 {next_index}，"
-                    f"下标不允许跳跃，整批不入库",
-                )
+            prev_rows = store.get_records_from(conn, session_id, next_index - 1)
+            prev_rec = TelemetryRecord.model_validate(
+                json.loads(prev_rows[0]["record_json"])
+            )
+            expected_start = prev_rec.soc_end_kwh
+            anchor_desc = f"已保存末态（下标 {next_index - 1} 的 soc_end）{expected_start}kWh"
 
-            # 边界衔接：首批接原初始 SOC，后续批接已保存最后一条末态
-            if next_index == 0:
-                expected_start = dispatch["initial_soc_kwh"]
-                anchor_desc = f"原初始 SOC {expected_start}kWh"
-            else:
-                prev_rows = store.get_records_from(conn, session_id, next_index - 1)
-                prev_rec = TelemetryRecord.model_validate(
-                    json.loads(prev_rows[0]["record_json"])
-                )
-                expected_start = prev_rec.soc_end_kwh
-                anchor_desc = f"已保存末态（下标 {next_index - 1} 的 soc_end）{expected_start}kWh"
+        start_gap = records[0].soc_start_kwh - expected_start
+        if abs(start_gap) > tol:
+            raise SessionError(
+                "batch_boundary_gap",
+                f"本批首条记录首态 SOC {records[0].soc_start_kwh}kWh 与{anchor_desc} "
+                f"相差 {start_gap:+.6f}kWh，超审计容差 {tol}kWh，整批不入库",
+            )
 
-            start_gap = records[0].soc_start_kwh - expected_start
-            if abs(start_gap) > tol:
-                raise SessionError(
-                    "batch_boundary_gap",
-                    f"本批首条记录首态 SOC {records[0].soc_start_kwh}kWh 与{anchor_desc} "
-                    f"相差 {start_gap:+.6f}kWh，超审计容差 {tol}kWh，整批不入库",
-                )
-
-            # 沿用现有遥测审计核对整批（含批内相邻记录 SOC 衔接）
-            batch_audit = _audit_range(records, start_index, eta_c, eta_d, tol)
-            bad = [a for a in batch_audit if a["anomalous"]]
-            if bad:
-                first_bad = bad[0]
-                detail = "；".join(first_bad["reasons"])
-                raise SessionError(
-                    "batch_audit_failed",
-                    f"本批下标 {start_index} 起的记录中，下标 {first_bad['index']} "
-                    f"未通过遥测审计，整批不入库：{detail}",
-                )
-
-            # 全部通过：整批入库（同一事务，任一条写入失败即整体回滚）
-            for offset, payload in enumerate(canonical):
-                store.insert_record(
-                    conn,
-                    session_id,
-                    start_index + offset,
-                    json.dumps(payload, ensure_ascii=False),
-                    stored_at,
-                )
-            confirmed += batch_size
-
-        # 重算本批审计（deduped 路径同样返回既有批次的审计结论）
+        # 沿用现有遥测审计核对整批（含批内相邻记录 SOC 衔接）
         batch_audit = _audit_range(records, start_index, eta_c, eta_d, tol)
-        start_gap = records[0].soc_start_kwh - (
-            dispatch["initial_soc_kwh"]
-            if start_index == 0
-            else _saved_end_soc_before(store, conn, session_id, start_index)
+        bad = [a for a in batch_audit if a["anomalous"]]
+        if bad:
+            first_bad = bad[0]
+            detail = "；".join(first_bad["reasons"])
+            raise SessionError(
+                "batch_audit_failed",
+                f"本批下标 {start_index} 起的记录中，下标 {first_bad['index']} "
+                f"未通过遥测审计，整批不入库：{detail}",
+            )
+
+        # 全部通过：整批记录、批次边界与首次回执在同一事务内确认，
+        # 任一条写入失败即整体回滚
+        for offset, payload in enumerate(canonical):
+            store.insert_record(
+                conn,
+                session_id,
+                start_index + offset,
+                json.dumps(payload, ensure_ascii=False),
+                stored_at,
+            )
+        confirmed += batch_size
+
+        # 本批结束即最新末态：首收回执在此冻结，后续批次入库不影响它
+        receipt = {
+            "session_id": session_id,
+            "start_index": start_index,
+            "batch_size": batch_size,
+            "result": "accepted",
+            "confirmed_periods": confirmed,
+            "next_index": confirmed,
+            "status": _status(confirmed, num_periods),
+            "batch_audit": batch_audit,
+            "first_record_soc_gap_kwh": _round6(start_gap),
+            "final_soc_kwh": _round6(records[-1].soc_end_kwh),
+        }
+        store.insert_batch(
+            conn,
+            session_id,
+            start_index,
+            batch_size,
+            json.dumps(receipt, ensure_ascii=False),
+            stored_at,
         )
-        result = "deduped" if overlap else "accepted"
-
-    final_soc = _final_soc(store, session_id)
-    return {
-        "session_id": session_id,
-        "start_index": start_index,
-        "batch_size": batch_size,
-        "result": result,
-        "confirmed_periods": confirmed,
-        "next_index": confirmed,
-        "status": _status(confirmed, num_periods),
-        "batch_audit": batch_audit,
-        "first_record_soc_gap_kwh": _round6(start_gap),
-        "final_soc_kwh": None if final_soc is None else _round6(final_soc),
-    }
-
-
-def _saved_end_soc_before(
-    store: SessionStore, conn, session_id: str, start_index: int
-) -> float:
-    """取 start_index 前一条已保存记录的末态 SOC（用于 deduped 时重算衔接差）。"""
-    rows = store.get_records_from(conn, session_id, start_index - 1)
-    return TelemetryRecord.model_validate(json.loads(rows[0]["record_json"])).soc_end_kwh
-
-
-def _final_soc(store: SessionStore, session_id: str) -> Optional[float]:
-    rows = store.get_all_records(session_id)
-    if not rows:
-        return None
-    return TelemetryRecord.model_validate(
-        json.loads(rows[-1]["record_json"])
-    ).soc_end_kwh
+        return receipt
 
 
 def get_session(session_id: str, store: Optional[SessionStore] = None) -> dict:

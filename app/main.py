@@ -42,10 +42,11 @@ app = FastAPI(
         "从实测末态重排余段，并给出可直接交给 /dispatch/settlement 的余段输入与快照；"
         "/dispatch/sessions 提供可持久接续的执行会话：创建时提交原 /dispatch 输入、"
         "完整计划快照与审计容差（先重算确认快照一致），之后按时段下标成批追加半小时"
-        "实测记录（沿用遥测审计、整批通过才入库、同起点重试幂等、内容不同返回冲突），"
+        "实测记录（沿用遥测审计、整批通过才入库、与已确认整批完全一致的重试幂等返回"
+        "首收回执、其余重叠上报返回冲突），"
         "记录持久化在 SQLite 中，进程重启后仍可查询、续报、续排与结算。"
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -224,7 +225,7 @@ async def create_dispatch_session(req: SessionCreateRequest) -> SessionCreateRes
     response_model=BatchAppendResponse,
     responses={
         404: {"model": ErrorResponse, "description": "会话不存在"},
-        409: {"model": ErrorResponse, "description": "同起点内容不同的重复/并发上报冲突"},
+        409: {"model": ErrorResponse, "description": "未与已确认整批完全一致的重叠/并发上报冲突"},
         422: {"model": ErrorResponse, "description": "非法输入、下标跳跃、越界、首态不接或批内审计异常"},
     },
     tags=["sessions"],
@@ -238,8 +239,10 @@ async def append_session_batch(
     - 首批首态 SOC 须在审计容差内接原初始 SOC，后续批次首态接已保存末态；
       批内沿用遥测审计逐条核对，动作偏离计划但自洽时仍接受；
     - 任一记录异常、下标跳跃或越界时整批不入库；
-    - 同起点已保存整批原样重试 → result=deduped 返回既有结果；
-      同起点内容不同 → 409 conflict，已保存的一份继续生效。
+    - 起点、长度、内容均与某已确认整批一致的原样重试 → result=deduped，
+      返回该批首次成功时冻结的回执（进度与末态不随后续批次漂移）；
+      同起点短批、内容变更、跨批拼接等重叠上报 → 409 conflict，
+      已保存记录与进度不变。
     """
     result = append_batch(
         session_id=session_id,
